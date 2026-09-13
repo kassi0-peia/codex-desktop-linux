@@ -9,13 +9,14 @@ use sha2::{Digest, Sha256};
 use std::{
     ffi::OsString,
     fs,
-    io::Write,
+    io::{self, Write},
     path::Path,
     process::{Command, Output, Stdio},
     time::Duration,
 };
 
 pub(crate) const ABANDONED_INSTALL_GRACE: Duration = Duration::from_secs(300);
+const BOOT_ID_PATH: &str = "/proc/sys/kernel/random/boot_id";
 
 const GATED_EXEC_SCRIPT: &str = r#"
 IFS= read -r state || exit 125
@@ -27,6 +28,19 @@ exec "$@"
 pub(crate) struct OwnedCommandFailure {
     pub error: anyhow::Error,
     pub mutation_may_have_started: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnerState {
+    /// No privileged package command has been released yet.
+    NotStarted,
+    /// The exact recorded package-command process is still running.
+    Running,
+    /// The recorded process is definitely gone or belongs to another boot or
+    /// process incarnation.
+    Exited,
+    /// The owner cannot be classified safely. Recovery must remain blocked.
+    Unknown,
 }
 
 impl OwnedCommandFailure {
@@ -54,6 +68,7 @@ pub(crate) fn begin(
     let package_sha256 = package_sha256(package_path)
         .with_context(|| format!("Failed to hash install package {}", package_path.display()))?;
     state.status = UpdateStatus::Installing;
+    state.manual_recovery_required = false;
     state.error_message = None;
     state.install_transaction = Some(InstallTransaction {
         package_path: package_path.to_path_buf(),
@@ -178,11 +193,12 @@ fn gated_command(command: &Command, launcher_program: &Path) -> Command {
     launcher
 }
 
-pub(crate) fn is_active(transaction: &InstallTransaction) -> bool {
+pub(crate) fn owner_state(transaction: &InstallTransaction) -> OwnerState {
     transaction
         .package_command
         .as_ref()
-        .is_some_and(identity_is_alive)
+        .map(owner_state_for_identity)
+        .unwrap_or(OwnerState::NotStarted)
 }
 
 pub(crate) fn grace_expired(transaction: &InstallTransaction) -> bool {
@@ -201,24 +217,71 @@ pub(crate) fn package_sha256(path: &Path) -> Result<String> {
 }
 
 fn process_identity(pid: u32) -> Result<ProcessIdentity> {
+    let boot_id = current_boot_id()?;
+    let start_time_ticks = read_process_start_time_ticks(pid)
+        .with_context(|| format!("Failed to read /proc/{pid}/stat"))?;
+    Ok(ProcessIdentity {
+        pid,
+        start_time_ticks,
+        boot_id: Some(boot_id),
+    })
+}
+
+fn current_boot_id() -> Result<String> {
+    let boot_id = fs::read_to_string(BOOT_ID_PATH)
+        .with_context(|| format!("Failed to read {BOOT_ID_PATH}"))?;
+    let boot_id = boot_id.trim();
+    anyhow::ensure!(!boot_id.is_empty(), "Kernel boot identity is empty");
+    Ok(boot_id.to_string())
+}
+
+fn read_process_start_time_ticks(pid: u32) -> io::Result<u64> {
     let stat_path = Path::new("/proc").join(pid.to_string()).join("stat");
-    let stat = fs::read_to_string(&stat_path)
-        .with_context(|| format!("Failed to read {}", stat_path.display()))?;
+    let stat = fs::read_to_string(&stat_path)?;
     let close_paren = stat
         .rfind(')')
-        .context("Malformed /proc stat: missing process-name terminator")?;
+        .ok_or_else(|| invalid_proc_stat("missing process-name terminator"))?;
     let fields = stat[close_paren + 1..]
         .split_whitespace()
         .collect::<Vec<_>>();
     let start_time_ticks = fields
         .get(19)
-        .context("Malformed /proc stat: missing process start time")?
+        .ok_or_else(|| invalid_proc_stat("missing process start time"))?
         .parse::<u64>()
-        .context("Malformed /proc stat process start time")?;
-    Ok(ProcessIdentity {
-        pid,
-        start_time_ticks,
-    })
+        .map_err(|_| invalid_proc_stat("invalid process start time"))?;
+    Ok(start_time_ticks)
+}
+
+fn invalid_proc_stat(message: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("Malformed /proc stat: {message}"),
+    )
+}
+
+fn process_exists(pid: u32) -> io::Result<bool> {
+    let pid = libc::pid_t::try_from(pid).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "persisted process identity does not fit in pid_t",
+        )
+    })?;
+    // kill(pid, 0) does not signal the process. It distinguishes an absent
+    // process (ESRCH) from a live process whose /proc entry is hidden or
+    // unreadable (EPERM), which is important when the owner has become root
+    // through pkexec on a hidepid-mounted procfs.
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(code) if code == libc::ESRCH => Ok(false),
+        Some(code) if code == libc::EPERM => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "process exists but its identity cannot be inspected",
+        )),
+        _ => Err(error),
+    }
 }
 
 #[cfg(test)]
@@ -226,10 +289,30 @@ pub(crate) fn test_current_process_identity() -> Result<ProcessIdentity> {
     process_identity(std::process::id())
 }
 
-fn identity_is_alive(identity: &ProcessIdentity) -> bool {
-    process_identity(identity.pid)
-        .map(|current| current.start_time_ticks == identity.start_time_ticks)
-        .unwrap_or(false)
+fn owner_state_for_identity(identity: &ProcessIdentity) -> OwnerState {
+    let Some(expected_boot_id) = identity.boot_id.as_deref() else {
+        return OwnerState::Unknown;
+    };
+    let current_boot_id = match current_boot_id() {
+        Ok(boot_id) => boot_id,
+        Err(_) => return OwnerState::Unknown,
+    };
+    if current_boot_id != expected_boot_id {
+        return OwnerState::Exited;
+    }
+
+    match read_process_start_time_ticks(identity.pid) {
+        Ok(start_time_ticks) if start_time_ticks == identity.start_time_ticks => {
+            OwnerState::Running
+        }
+        Ok(_) => OwnerState::Exited,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => match process_exists(identity.pid)
+        {
+            Ok(false) => OwnerState::Exited,
+            Ok(true) | Err(_) => OwnerState::Unknown,
+        },
+        Err(_) => OwnerState::Unknown,
+    }
 }
 
 #[cfg(test)]
@@ -240,13 +323,38 @@ mod tests {
     #[test]
     fn process_identity_is_pid_reuse_safe() -> Result<()> {
         let current = process_identity(std::process::id())?;
-        assert!(identity_is_alive(&current));
+        assert_eq!(owner_state_for_identity(&current), OwnerState::Running);
 
         let stale = ProcessIdentity {
             pid: current.pid,
             start_time_ticks: current.start_time_ticks.wrapping_add(1),
+            boot_id: current.boot_id.clone(),
         };
-        assert!(!identity_is_alive(&stale));
+        assert_eq!(owner_state_for_identity(&stale), OwnerState::Exited);
+        Ok(())
+    }
+
+    #[test]
+    fn boot_mismatch_confirms_owner_is_exited() -> Result<()> {
+        let current = process_identity(std::process::id())?;
+        let stale = ProcessIdentity {
+            pid: current.pid,
+            start_time_ticks: current.start_time_ticks,
+            boot_id: Some("different-boot".into()),
+        };
+        assert_eq!(owner_state_for_identity(&stale), OwnerState::Exited);
+        Ok(())
+    }
+
+    #[test]
+    fn missing_boot_identity_is_unknown_and_blocks_recovery() -> Result<()> {
+        let current = process_identity(std::process::id())?;
+        let legacy = ProcessIdentity {
+            pid: current.pid,
+            start_time_ticks: current.start_time_ticks,
+            boot_id: None,
+        };
+        assert_eq!(owner_state_for_identity(&legacy), OwnerState::Unknown);
         Ok(())
     }
 
@@ -256,6 +364,7 @@ mod tests {
         let stale = ProcessIdentity {
             pid: current.pid,
             start_time_ticks: current.start_time_ticks.wrapping_add(1),
+            boot_id: current.boot_id.clone(),
         };
         let tx = InstallTransaction {
             package_path: PathBuf::from("/tmp/codex.deb"),
@@ -265,7 +374,7 @@ mod tests {
                 - chrono::Duration::seconds(ABANDONED_INSTALL_GRACE.as_secs() as i64 + 1),
             operation: InstallOperation::Update,
         };
-        assert!(!is_active(&tx));
+        assert_eq!(owner_state(&tx), OwnerState::Exited);
         assert!(grace_expired(&tx));
         Ok(())
     }
@@ -319,6 +428,43 @@ mod tests {
         let status = child.wait()?;
         assert!(status.success());
         assert!(marker.is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn package_command_observes_persisted_owner_before_release() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state_file = dir.path().join("state/state.json");
+        let package = dir.path().join("candidate.deb");
+        let marker = dir.path().join("mutation-started");
+        fs::write(&package, b"fixture")?;
+
+        let mut state = PersistedState::new(true);
+        begin(&mut state, &state_file, &package, InstallOperation::Update)?;
+
+        let mut command = Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "grep -q '\"package_command\": {' \"$CODEX_TEST_STATE_FILE\" && grep -q '\"boot_id\":' \"$CODEX_TEST_STATE_FILE\" && : > \"$CODEX_TEST_MUTATION_MARKER\"",
+            ])
+            .env("CODEX_TEST_STATE_FILE", &state_file)
+            .env("CODEX_TEST_MUTATION_MARKER", &marker);
+
+        let output = run_owned_command_with_launcher(
+            &mut command,
+            &mut state,
+            &state_file,
+            Path::new("/bin/sh"),
+        )
+        .map_err(|failure| failure.error)?;
+        assert!(output.status.success());
+        assert!(marker.is_file());
+        let persisted = PersistedState::load_or_default(&state_file, true)?;
+        assert!(persisted
+            .install_transaction
+            .and_then(|transaction| transaction.package_command)
+            .is_some());
         Ok(())
     }
 

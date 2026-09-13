@@ -1,6 +1,8 @@
 //! Installation helpers for privileged and non-privileged package application.
 
 use anyhow::{Context, Result};
+#[cfg(test)]
+use std::cell::RefCell;
 use std::ffi::OsStr;
 use std::{
     fs,
@@ -43,6 +45,15 @@ pub enum PackageKind {
     Rpm,
     Pacman,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PackageIdentity {
+    name: String,
+    version: String,
+    architecture: String,
+}
+
+const RPM_IDENTITY_QUERY: &str = "%{NAME}\t%{VERSION}-%{RELEASE}\t%{ARCH}";
 
 impl PackageKind {
     pub fn detect() -> Self {
@@ -189,10 +200,8 @@ fn installed_deb_version() -> String {
 pub(crate) fn installed_package_version_for_recovery(path: &Path) -> Option<String> {
     match PackageKind::from_path(path) {
         PackageKind::Deb => installed_deb_version_if_configured(),
-        // rpm/pacman expose the installed version, but that alone is not proof
-        // that an abandoned package transaction completed successfully. Fail
-        // closed until an equally strong completion predicate exists there.
-        PackageKind::Rpm | PackageKind::Pacman => None,
+        PackageKind::Rpm => installed_rpm_version_for_recovery(path),
+        PackageKind::Pacman => installed_pacman_version_for_recovery(path),
     }
 }
 
@@ -214,6 +223,138 @@ fn parse_configured_deb_version(stdout: &[u8]) -> Option<String> {
         return None;
     }
     Some(version.to_string())
+}
+
+fn installed_rpm_version_for_recovery(path: &Path) -> Option<String> {
+    let candidate = rpm_package_identity(path).ok()?;
+    let installed = rpm_installed_package_identity().ok()?;
+    if candidate != installed || installed.name != PACKAGE_NAME {
+        return None;
+    }
+
+    // rpm's verification pass checks the installed package database against
+    // the payload on disk. The package identity match alone would not rule
+    // out a database entry from an interrupted or unrelated transaction.
+    let verification = Command::new(program_path(RPM_CANDIDATES, "rpm"))
+        .args(["-V", "--noscripts", "--", PACKAGE_NAME])
+        .output()
+        .ok()?;
+    if !verification.status.success() || !verification.stdout.is_empty() {
+        return None;
+    }
+
+    Some(installed.version)
+}
+
+fn rpm_package_identity(path: &Path) -> Result<PackageIdentity> {
+    let output = rpm_query_command(path, RPM_IDENTITY_QUERY)
+        .output()
+        .context("Failed to inspect RPM package identity")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "rpm could not read the package identity from {}",
+        path.display()
+    );
+    parse_rpm_package_identity(&output.stdout)
+}
+
+fn rpm_installed_package_identity() -> Result<PackageIdentity> {
+    let output = Command::new(program_path(RPM_CANDIDATES, "rpm"))
+        .args([
+            "-q",
+            "--queryformat",
+            RPM_IDENTITY_QUERY,
+            "--",
+            PACKAGE_NAME,
+        ])
+        .output()
+        .context("Failed to inspect installed RPM package identity")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "rpm could not read the installed package identity"
+    );
+    parse_rpm_package_identity(&output.stdout)
+}
+
+fn parse_rpm_package_identity(stdout: &[u8]) -> Result<PackageIdentity> {
+    let text = String::from_utf8(stdout.to_vec()).context("rpm returned a non-UTF8 identity")?;
+    let fields = text.trim().split('\t').collect::<Vec<_>>();
+    anyhow::ensure!(
+        fields.len() == 3 && fields.iter().all(|field| !field.is_empty()),
+        "rpm returned an invalid package identity"
+    );
+    Ok(PackageIdentity {
+        name: fields[0].to_string(),
+        version: fields[1].to_string(),
+        architecture: fields[2].to_string(),
+    })
+}
+
+fn installed_pacman_version_for_recovery(path: &Path) -> Option<String> {
+    let candidate = pacman_package_identity(path).ok()?;
+    let installed = pacman_installed_package_identity().ok()?;
+    if candidate != installed || installed.name != PACKAGE_NAME {
+        return None;
+    }
+
+    // pacman -Qkk verifies that the files recorded for the installed package
+    // are present and intact. This is stronger than trusting pacman -Q's
+    // version string after an owner process disappeared.
+    let verification = pacman_query_command(["-Qkk", "--", PACKAGE_NAME])
+        .output()
+        .ok()?;
+    if !verification.status.success() {
+        return None;
+    }
+
+    Some(installed.version)
+}
+
+fn pacman_package_identity(path: &Path) -> Result<PackageIdentity> {
+    let output = pacman_query_info_command(path)
+        .output()
+        .context("Failed to inspect pacman package identity")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "pacman could not read the package identity from {}",
+        path.display()
+    );
+    parse_pacman_package_identity(&output.stdout)
+}
+
+fn pacman_installed_package_identity() -> Result<PackageIdentity> {
+    let output = pacman_query_command(["-Qi", "--", PACKAGE_NAME])
+        .output()
+        .context("Failed to inspect installed pacman package identity")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "pacman could not read the installed package identity"
+    );
+    parse_pacman_package_identity(&output.stdout)
+}
+
+fn parse_pacman_package_identity(stdout: &[u8]) -> Result<PackageIdentity> {
+    let text = String::from_utf8(stdout.to_vec()).context("pacman returned a non-UTF8 identity")?;
+    let mut name = None;
+    let mut version = None;
+    let mut architecture = None;
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let value = value.trim();
+        match key.trim() {
+            "Name" => name = Some(value.to_string()),
+            "Version" => version = Some(value.to_string()),
+            "Architecture" => architecture = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    Ok(PackageIdentity {
+        name: name.context("pacman output is missing the package name")?,
+        version: version.context("pacman output is missing the package version")?,
+        architecture: architecture.context("pacman output is missing the package architecture")?,
+    })
 }
 
 fn installed_rpm_version() -> String {
@@ -744,8 +885,20 @@ fn rpm_query_command(path: &Path, queryformat: &str) -> Command {
 }
 
 fn pacman_query_name_command(path: &Path) -> Command {
+    let mut command = pacman_query_command(["-Qqp", "--"]);
+    command.arg(path);
+    command
+}
+
+fn pacman_query_info_command(path: &Path) -> Command {
+    let mut command = pacman_query_command(["-Qip", "--"]);
+    command.arg(path);
+    command
+}
+
+fn pacman_query_command<const N: usize>(args: [&str; N]) -> Command {
     let mut command = Command::new(program_path(PACMAN_CANDIDATES, "pacman"));
-    command.args(["-Qqp", "--"]).arg(path);
+    command.env("LC_ALL", "C").args(args);
     command
 }
 
@@ -875,11 +1028,69 @@ fn program_exists(candidates: &[&str], fallback: &str) -> bool {
 }
 
 fn program_path(candidates: &[&str], fallback: &str) -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = test_program_path_override(fallback) {
+        return path;
+    }
+
     candidates
         .iter()
         .map(PathBuf::from)
         .find(|path| path.is_file())
         .unwrap_or_else(|| PathBuf::from(fallback))
+}
+
+#[cfg(test)]
+fn test_program_path_override(fallback: &str) -> Option<PathBuf> {
+    TEST_PROGRAM_PATH_OVERRIDES.with(|overrides| {
+        let overrides = overrides.borrow();
+        match fallback {
+            "rpm" => overrides.rpm.clone(),
+            "pacman" => overrides.pacman.clone(),
+            _ => None,
+        }
+    })
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
+struct TestProgramPathOverrides {
+    rpm: Option<PathBuf>,
+    pacman: Option<PathBuf>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_PROGRAM_PATH_OVERRIDES: RefCell<TestProgramPathOverrides> =
+        RefCell::new(TestProgramPathOverrides::default());
+}
+
+#[cfg(test)]
+pub(crate) struct TestProgramPathGuard {
+    previous: TestProgramPathOverrides,
+}
+
+#[cfg(test)]
+impl Drop for TestProgramPathGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.clone();
+        TEST_PROGRAM_PATH_OVERRIDES.with(|overrides| {
+            *overrides.borrow_mut() = previous;
+        });
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_program_path_overrides(
+    rpm: Option<&Path>,
+    pacman: Option<&Path>,
+) -> TestProgramPathGuard {
+    let next = TestProgramPathOverrides {
+        rpm: rpm.map(Path::to_path_buf),
+        pacman: pacman.map(Path::to_path_buf),
+    };
+    let previous = TEST_PROGRAM_PATH_OVERRIDES.with(|overrides| overrides.replace(next));
+    TestProgramPathGuard { previous }
 }
 
 fn command_exists(name: &str) -> bool {
@@ -1429,5 +1640,35 @@ mod tests {
             parse_configured_deb_version(b"install ok half-configured\t2026.09.06\n"),
             None
         );
+    }
+
+    #[test]
+    fn recovery_parses_exact_rpm_package_identity() -> Result<()> {
+        assert_eq!(
+            parse_rpm_package_identity(b"codex-desktop\t2026.09.06-1.fc42\tx86_64\n")?,
+            PackageIdentity {
+                name: "codex-desktop".into(),
+                version: "2026.09.06-1.fc42".into(),
+                architecture: "x86_64".into(),
+            }
+        );
+        assert!(parse_rpm_package_identity(b"codex-desktop\t2026.09.06-1.fc42\n").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_parses_exact_pacman_package_identity() -> Result<()> {
+        assert_eq!(
+            parse_pacman_package_identity(
+                b"Name            : codex-desktop\nVersion         : 2026.09.06-1\nArchitecture    : x86_64\n"
+            )?,
+            PackageIdentity {
+                name: "codex-desktop".into(),
+                version: "2026.09.06-1".into(),
+                architecture: "x86_64".into(),
+            }
+        );
+        assert!(parse_pacman_package_identity(b"Name : codex-desktop\n").is_err());
+        Ok(())
     }
 }

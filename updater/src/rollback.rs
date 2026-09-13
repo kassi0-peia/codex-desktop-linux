@@ -55,6 +55,9 @@ async fn run_with_launcher(
         .clone()
         .or_else(|| Some(state.installed_version.clone()));
     let blocked_sha = state.upstream_package_sha256.clone();
+    // The explicit rollback command confirms that the user has checked for an
+    // orphaned package manager after any ambiguous interrupted transaction.
+    state.manual_recovery_required = false;
     install_transaction::begin(
         state,
         &paths.state_file,
@@ -82,6 +85,22 @@ async fn run_with_launcher(
         }
     };
     if !output.status.success() {
+        if matches!(output.status.code(), Some(126 | 127)) {
+            // pkexec uses 126/127 when authorization was dismissed or could
+            // not be obtained. No package mutation was released, so clear the
+            // transaction and leave the candidate retryable instead of making
+            // recovery wait for the abandoned-transaction grace period.
+            let mut message = format!("privileged rollback exited with status {}", output.status);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = stderr.trim();
+            if !stderr.is_empty() {
+                message.push_str(": ");
+                message.push_str(stderr);
+            }
+            state.mark_failed(&message);
+            state.save_updater(&paths.state_file)?;
+            anyhow::bail!(message);
+        }
         // Once the gated command has been released, a nonzero package-manager
         // exit is not evidence that rollback made no changes. Preserve the
         // durable transaction so the same recovery path can reconcile it.
@@ -168,6 +187,62 @@ mod tests {
             persisted.install_transaction.is_some(),
             "post-release rollback failure must preserve durable recovery evidence"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn authentication_cancelled_rollback_is_retryable() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = RuntimePaths {
+            config_file: dir.path().join("config/config.toml"),
+            state_file: dir.path().join("state/state.json"),
+            log_file: dir.path().join("state/service.log"),
+            cache_dir: dir.path().join("cache"),
+            state_dir: dir.path().join("state"),
+            config_dir: dir.path().join("config"),
+        };
+        paths.ensure_dirs()?;
+        let mut config = RuntimeConfig::default_with_paths(&paths);
+        config.app_executable_path = dir.path().join("app-not-running");
+
+        let package = dir.path().join("known-good.deb");
+        fs::write(&package, b"fixture package")?;
+
+        for code in [126, 127] {
+            let launcher = dir.path().join(format!("cancelled-rollback-{code}"));
+            fs::write(
+                &launcher,
+                format!(
+                    "#!/bin/sh\nIFS= read -r state || exit 125\n[ \"$state\" = go ] || exit 125\nexit {code}\n"
+                ),
+            )?;
+            fs::set_permissions(&launcher, fs::Permissions::from_mode(0o755))?;
+
+            let mut state = PersistedState::new(true);
+            state.status = UpdateStatus::Installed;
+            state.installed_version = "bad-local".into();
+            state.artifact_paths.rollback_package_path = Some(package.clone());
+            state.save_updater(&paths.state_file)?;
+
+            let error = run_with_launcher(&config, &mut state, &paths, &launcher)
+                .await
+                .expect_err("authentication cancellation should be reported");
+            assert!(error
+                .to_string()
+                .contains(&format!("status exit status: {code}")));
+
+            let persisted = PersistedState::load_or_default(
+                &paths.state_file,
+                config.auto_install_on_app_exit,
+            )?;
+            assert_eq!(persisted.status, UpdateStatus::Failed);
+            assert!(persisted.install_transaction.is_none());
+            assert!(!persisted.manual_recovery_required);
+            assert!(persisted
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("privileged rollback exited")));
+        }
         Ok(())
     }
 }

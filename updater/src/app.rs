@@ -18,6 +18,8 @@ use std::{
 use tokio::time;
 use tracing::{error, info, warn};
 
+const UNKNOWN_INSTALL_RECOVERY_MESSAGE: &str = "Package transaction owner could not be classified safely after the recovery grace period; automatic recovery stopped. Confirm no package manager is running, then explicitly retry the interrupted update or rollback";
+
 pub async fn run(cli: Cli) -> Result<()> {
     if let Some(result) = run_privileged_command(&cli.command) {
         return result;
@@ -77,7 +79,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 &paths.state_file,
                 config.auto_install_on_app_exit,
             )?;
-            if !prepare_mutation_state(&config, &mut state, &paths)? {
+            if !prepare_explicit_mutation_state(&config, &mut state, &paths)? {
                 println!(
                     "A package transaction is still active; refusing to start another install."
                 );
@@ -95,7 +97,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 &paths.state_file,
                 config.auto_install_on_app_exit,
             )?;
-            if !prepare_mutation_state(&config, &mut state, &paths)? {
+            if !prepare_explicit_mutation_state(&config, &mut state, &paths)? {
                 println!("A package transaction is still active; refusing to start rollback.");
                 return Ok(());
             }
@@ -213,7 +215,29 @@ fn prepare_mutation_state(
     state: &mut PersistedState,
     paths: &RuntimePaths,
 ) -> Result<bool> {
+    prepare_mutation_state_with_policy(config, state, paths, false)
+}
+
+fn prepare_explicit_mutation_state(
+    config: &RuntimeConfig,
+    state: &mut PersistedState,
+    paths: &RuntimePaths,
+) -> Result<bool> {
+    prepare_mutation_state_with_policy(config, state, paths, true)
+}
+
+fn prepare_mutation_state_with_policy(
+    config: &RuntimeConfig,
+    state: &mut PersistedState,
+    paths: &RuntimePaths,
+    allow_manual_recovery: bool,
+) -> Result<bool> {
     *state = PersistedState::load_or_default(&paths.state_file, config.auto_install_on_app_exit)?;
+
+    if state.manual_recovery_required && !allow_manual_recovery {
+        warn!("manual recovery confirmation is required before automatic updater work");
+        return Ok(false);
+    }
 
     if state.status != UpdateStatus::Installing {
         state.installed_version = install::installed_package_version();
@@ -222,15 +246,41 @@ fn prepare_mutation_state(
     }
 
     match state.install_transaction.clone() {
-        Some(transaction)
-            if install_transaction::is_active(&transaction)
-                || !install_transaction::grace_expired(&transaction) =>
-        {
-            Ok(false)
-        }
-        Some(_) => {
-            recover_abandoned_install(state, paths)?;
-            Ok(true)
+        Some(transaction) => {
+            let owner_state = install_transaction::owner_state(&transaction);
+            match owner_state {
+                install_transaction::OwnerState::Running => Ok(false),
+                install_transaction::OwnerState::Unknown => {
+                    if !install_transaction::grace_expired(&transaction) {
+                        warn!(
+                            "package transaction owner cannot be classified safely; deferring recovery"
+                        );
+                        return Ok(false);
+                    }
+                    state.mark_manual_recovery_required(UNKNOWN_INSTALL_RECOVERY_MESSAGE);
+                    state.save_updater(&paths.state_file)?;
+                    if allow_manual_recovery {
+                        // This explicit install-ready/rollback invocation is
+                        // the user's confirmation that no package manager is
+                        // still running. The transaction has been cleared, so
+                        // the requested operation can proceed immediately.
+                        Ok(true)
+                    } else {
+                        Ok(false)
+                    }
+                }
+                install_transaction::OwnerState::NotStarted
+                | install_transaction::OwnerState::Exited
+                    if !install_transaction::grace_expired(&transaction) =>
+                {
+                    Ok(false)
+                }
+                install_transaction::OwnerState::NotStarted
+                | install_transaction::OwnerState::Exited => {
+                    recover_abandoned_install(state, paths)?;
+                    Ok(true)
+                }
+            }
         }
         None => {
             state.mark_failed("Installing state has no recoverable package transaction owner");
@@ -336,6 +386,7 @@ fn apply_reconciled_install(
     }
 
     state.status = UpdateStatus::Installed;
+    state.manual_recovery_required = false;
     state.install_transaction = None;
     state.error_message = None;
 }
@@ -558,6 +609,11 @@ async fn install_ready_with_launcher(
         "rebuilt package is missing: {}",
         package.display()
     );
+    if explicit_retry {
+        // An explicit install-ready command is the user's confirmation that
+        // any previously ambiguous package transaction has been checked.
+        state.manual_recovery_required = false;
+    }
     let auth_retry_blocked = state.install_auth_retry_is_blocked();
     let install_after_app_exit_requested = state.install_after_app_exit_requested;
     if liveness::is_app_running(config)? {
@@ -710,6 +766,10 @@ fn status(state: &PersistedState, json: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(state)?);
     } else {
         println!("status: {:?}", state.status);
+        println!(
+            "manual_recovery_required: {}",
+            state.manual_recovery_required
+        );
         println!("installed_version: {}", state.installed_version);
         println!(
             "installed_upstream_version: {}",
@@ -745,6 +805,7 @@ fn diagnose(
         "builderBundle": config.builder_bundle_root,
         "stateFile": paths.state_file,
         "stateSchema": state.schema_version,
+        "manualRecoveryRequired": state.manual_recovery_required,
         "appRunning": liveness::is_app_running(config)?,
         "status": state.status,
     });
@@ -808,6 +869,7 @@ mod replacement_tests {
         ProcessIdentity {
             pid: std::process::id(),
             start_time_ticks: 0,
+            boot_id: Some("stale-boot".into()),
         }
     }
 
@@ -837,6 +899,93 @@ mod replacement_tests {
             &path,
             "#!/bin/sh\nprintf x >> \"$CODEX_UPDATE_MANAGER_TEST_PKEXEC_COUNT\"\nexit \"$CODEX_UPDATE_MANAGER_TEST_PKEXEC_EXIT\"\n",
         )?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+        Ok(path)
+    }
+
+    fn abandoned_state(package: PathBuf, installed_version: &str) -> Result<PersistedState> {
+        let package_sha256 = install_transaction::package_sha256(&package)?;
+        let mut state = PersistedState::new(true);
+        state.status = UpdateStatus::Installing;
+        state.installed_version = installed_version.into();
+        state.candidate_version = Some("candidate-upstream".into());
+        state.upstream_package_sha256 = Some("candidate-upstream-sha".into());
+        state.install_transaction = Some(InstallTransaction {
+            package_path: package,
+            package_sha256: Some(package_sha256),
+            package_command: Some(stale_identity()),
+            started_at: Utc::now()
+                - chrono::Duration::seconds(
+                    install_transaction::ABANDONED_INSTALL_GRACE.as_secs() as i64 + 1,
+                ),
+            operation: InstallOperation::Update,
+        });
+        Ok(state)
+    }
+
+    fn write_fake_rpm_recovery_command(
+        root: &Path,
+        verification_succeeds: bool,
+    ) -> Result<PathBuf> {
+        let path = root.join("rpm-recovery-fixture");
+        let verification = if verification_succeeds {
+            "exit 0"
+        } else {
+            "exit 1"
+        };
+        let script = r#"#!/bin/sh
+set -eu
+if [ "$1" = "-V" ]; then
+  [ "$2" = "--noscripts" ]
+  __VERIFY__
+fi
+if [ "$1" = "-q" ] || [ "$1" = "-qp" ]; then
+  if [ "$3" = "%{NAME}" ]; then
+    printf 'codex-desktop\n'
+  elif [ "$3" = "%{VERSION}-%{RELEASE}" ]; then
+    printf '2026.09.06-1.fc42\n'
+  else
+    printf 'codex-desktop\t2026.09.06-1.fc42\tx86_64\n'
+  fi
+  exit 0
+fi
+exit 90
+"#
+        .replace("__VERIFY__", verification);
+        fs::write(&path, script)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+        Ok(path)
+    }
+
+    fn write_fake_pacman_recovery_command(
+        root: &Path,
+        verification_succeeds: bool,
+    ) -> Result<PathBuf> {
+        let path = root.join("pacman-recovery-fixture");
+        let verification = if verification_succeeds {
+            "exit 0"
+        } else {
+            "exit 1"
+        };
+        let script = r#"#!/bin/sh
+set -eu
+if [ "$1" = "-Q" ] && [ "$2" = "codex-desktop" ]; then
+  printf 'codex-desktop 2026.09.06-1\n'
+  exit 0
+fi
+if [ "$1" = "-Qip" ] || [ "$1" = "-Qi" ]; then
+  printf 'Name            : codex-desktop\n'
+  printf 'Version         : 2026.09.06-1\n'
+  printf 'Architecture    : x86_64\n'
+  exit 0
+fi
+if [ "$1" = "-Qkk" ]; then
+  __VERIFY__
+fi
+exit 90
+"#
+        .replace("__VERIFY__", verification);
+        fs::write(&path, script)?;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
         Ok(path)
     }
@@ -1088,6 +1237,91 @@ mod replacement_tests {
     }
 
     #[test]
+    fn legacy_install_owner_migrates_to_manual_recovery() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = fixture_paths(dir.path());
+        paths.ensure_dirs()?;
+        let config = RuntimeConfig::default_with_paths(&paths);
+        let current = install_transaction::test_current_process_identity()?;
+
+        let mut state = PersistedState::new(true);
+        state.schema_version = 2;
+        state.status = UpdateStatus::Installing;
+        state.install_transaction = Some(InstallTransaction {
+            package_path: dir.path().join("candidate.deb"),
+            package_sha256: Some("fixture".into()),
+            package_command: Some(ProcessIdentity {
+                pid: current.pid,
+                start_time_ticks: current.start_time_ticks,
+                // This models a persisted owner from before boot identity was
+                // available, which cannot be classified safely now.
+                boot_id: None,
+            }),
+            started_at: Utc::now()
+                - chrono::Duration::seconds(
+                    install_transaction::ABANDONED_INSTALL_GRACE.as_secs() as i64 + 1,
+                ),
+            operation: InstallOperation::Update,
+        });
+        state.save_updater(&paths.state_file)?;
+
+        assert!(!prepare_mutation_state(&config, &mut state, &paths)?);
+        assert_eq!(state.schema_version, 3);
+        assert_eq!(state.status, UpdateStatus::Failed);
+        assert!(state.manual_recovery_required);
+        assert!(state.install_transaction.is_none());
+        assert!(state
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("reboot-safe process identity")));
+
+        assert!(prepare_explicit_mutation_state(
+            &config, &mut state, &paths
+        )?);
+        assert!(state.manual_recovery_required);
+        Ok(())
+    }
+
+    #[test]
+    fn unknown_install_owner_becomes_manual_after_recovery_grace() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = fixture_paths(dir.path());
+        paths.ensure_dirs()?;
+        let config = RuntimeConfig::default_with_paths(&paths);
+        let current = install_transaction::test_current_process_identity()?;
+        let mut state = PersistedState::new(true);
+        state.status = UpdateStatus::Installing;
+        state.install_transaction = Some(InstallTransaction {
+            package_path: dir.path().join("candidate.deb"),
+            package_sha256: Some("fixture".into()),
+            package_command: Some(ProcessIdentity {
+                // This value cannot be represented by pid_t on Linux. The
+                // resulting classification is deliberately Unknown, rather
+                // than treating an unreadable owner as definitely exited.
+                pid: u32::MAX,
+                start_time_ticks: current.start_time_ticks,
+                boot_id: current.boot_id,
+            }),
+            started_at: Utc::now()
+                - chrono::Duration::seconds(
+                    install_transaction::ABANDONED_INSTALL_GRACE.as_secs() as i64 + 1,
+                ),
+            operation: InstallOperation::Update,
+        });
+        state.save_updater(&paths.state_file)?;
+
+        assert!(!prepare_mutation_state(&config, &mut state, &paths)?);
+        assert_eq!(state.status, UpdateStatus::Failed);
+        assert!(state.manual_recovery_required);
+        assert!(state.install_transaction.is_none());
+        assert!(state
+            .error_message
+            .as_deref()
+            .is_some_and(|message| message.contains("could not be classified safely")));
+        Ok(())
+    }
+
+    #[test]
     fn ownerless_installing_state_converges_to_failed_without_replacement_detection() -> Result<()>
     {
         let dir = tempfile::tempdir()?;
@@ -1097,6 +1331,92 @@ mod replacement_tests {
         let mut state = PersistedState::new(true);
         state.status = UpdateStatus::Installing;
         state.install_transaction = None;
+        state.save_updater(&paths.state_file)?;
+
+        assert!(prepare_mutation_state(&config, &mut state, &paths)?);
+        assert_eq!(state.status, UpdateStatus::Failed);
+        assert!(state.install_transaction.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn abandoned_rpm_install_reconciles_after_verified_payload() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = fixture_paths(dir.path());
+        paths.ensure_dirs()?;
+        let package = dir.path().join("codex-desktop.rpm");
+        fs::write(&package, b"rpm fixture")?;
+        let fake_rpm = write_fake_rpm_recovery_command(dir.path(), true)?;
+        let _package_manager_paths = install::test_program_path_overrides(Some(&fake_rpm), None);
+
+        let config = RuntimeConfig::default_with_paths(&paths);
+        let mut state = abandoned_state(package, "2026.09.05-1.fc42")?;
+        state.save_updater(&paths.state_file)?;
+
+        assert!(prepare_mutation_state(&config, &mut state, &paths)?);
+        assert_eq!(state.status, UpdateStatus::Installed);
+        assert_eq!(state.installed_version, "2026.09.06-1.fc42");
+        assert!(state.install_transaction.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn abandoned_rpm_install_rejects_unverified_payload() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = fixture_paths(dir.path());
+        paths.ensure_dirs()?;
+        let package = dir.path().join("codex-desktop.rpm");
+        fs::write(&package, b"rpm fixture")?;
+        let fake_rpm = write_fake_rpm_recovery_command(dir.path(), false)?;
+        let _package_manager_paths = install::test_program_path_overrides(Some(&fake_rpm), None);
+
+        let config = RuntimeConfig::default_with_paths(&paths);
+        let mut state = abandoned_state(package, "2026.09.05-1.fc42")?;
+        state.save_updater(&paths.state_file)?;
+
+        assert!(prepare_mutation_state(&config, &mut state, &paths)?);
+        assert_eq!(state.status, UpdateStatus::Failed);
+        assert!(state.install_transaction.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn abandoned_pacman_install_reconciles_after_verified_payload() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = fixture_paths(dir.path());
+        paths.ensure_dirs()?;
+        let package = dir
+            .path()
+            .join("codex-desktop-2026.09.06-1-x86_64.pkg.tar.zst");
+        fs::write(&package, b"pacman fixture")?;
+        let fake_pacman = write_fake_pacman_recovery_command(dir.path(), true)?;
+        let _package_manager_paths = install::test_program_path_overrides(None, Some(&fake_pacman));
+
+        let config = RuntimeConfig::default_with_paths(&paths);
+        let mut state = abandoned_state(package, "2026.09.05-1")?;
+        state.save_updater(&paths.state_file)?;
+
+        assert!(prepare_mutation_state(&config, &mut state, &paths)?);
+        assert_eq!(state.status, UpdateStatus::Installed);
+        assert_eq!(state.installed_version, "2026.09.06-1");
+        assert!(state.install_transaction.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn abandoned_pacman_install_rejects_unverified_payload() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let paths = fixture_paths(dir.path());
+        paths.ensure_dirs()?;
+        let package = dir
+            .path()
+            .join("codex-desktop-2026.09.06-1-x86_64.pkg.tar.zst");
+        fs::write(&package, b"pacman fixture")?;
+        let fake_pacman = write_fake_pacman_recovery_command(dir.path(), false)?;
+        let _package_manager_paths = install::test_program_path_overrides(None, Some(&fake_pacman));
+
+        let config = RuntimeConfig::default_with_paths(&paths);
+        let mut state = abandoned_state(package, "2026.09.05-1")?;
         state.save_updater(&paths.state_file)?;
 
         assert!(prepare_mutation_state(&config, &mut state, &paths)?);
